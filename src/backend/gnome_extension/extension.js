@@ -96,6 +96,22 @@ function windowInfo(win) {
     return {appId, title, pid, wmClass};
 }
 
+// Wispr Flow's own auxiliary windows that are never meant to be taskbar/
+// Alt-Tab entries (the dictation status pill, the in-app context menu, ...).
+// Electron creates each of these with `skipTaskbar: true`, but that hint has
+// no effect under native Wayland: Electron's Ozone/Wayland backend talks raw
+// xdg-shell and never creates a GtkWindow, so the gtk_shell1 protocol that
+// carries the skip-taskbar request to Mutter is never spoken. Mutter is left
+// to assume every xdg_toplevel is an ordinary app window, so the transparent,
+// click-through status pill shows up as a second, empty-looking window in the
+// taskbar/Overview/Alt-Tab (issue: the pill is "always open" from the user's
+// perspective). We run inside gnome-shell's own process, so we can correct
+// Mutter's classification directly via Meta.Window, independent of whatever
+// protocol the client did or didn't speak. `Hub` and `Scratchpad` are the
+// only two Wispr Flow windows meant to be real, user-facing taskbar entries.
+const WISPR_WM_CLASS = 'wispr-flow';
+const WISPR_TASKBAR_TITLES = new Set(['Hub', 'Scratchpad']);
+
 export default class WindowBridgeExtension extends Extension {
     enable() {
         this._dbusImpl = Gio.DBusExportedObject.wrapJSObject(IFACE_XML, this);
@@ -121,9 +137,101 @@ export default class WindowBridgeExtension extends Extension {
 
         // Seed the title-watch on whatever already has focus.
         this._onFocusChanged();
+
+        // Hide Wispr Flow's non-taskbar windows from the taskbar/Alt-Tab/
+        // Overview. `map` (not `window-created`) because wm_class/title are
+        // not reliably populated yet at creation time -- they're set by the
+        // point the compositor maps the surface.
+        this._mapId = global.window_manager.connect('map', (_wm, actor) =>
+            this._hideIfAuxiliary(actor.meta_window)
+        );
+        // Catch anything already mapped before we were enabled (e.g. this
+        // extension re-enabling mid-session after a GNOME Shell restart).
+        global.get_window_actors().forEach(a =>
+            this._hideIfAuxiliary(a.meta_window)
+        );
+    }
+
+    // Excludes win from the taskbar/Alt-Tab/Overview switcher if it is one of
+    // Wispr Flow's auxiliary windows, and corrects its window type so it
+    // actually behaves like the overlay it's meant to be. Idempotent and safe
+    // to call repeatedly (each of these calls is a no-op on a window already
+    // in the target state), so both the `map` handler and the enable()-time
+    // sweep can call it unconditionally without tracking which windows were
+    // already seen.
+    _hideIfAuxiliary(win) {
+        if (!win)
+            return;
+        try {
+            if (win.get_wm_class() !== WISPR_WM_CLASS)
+                return;
+            // The title (and possibly other window properties) may not be
+            // populated yet at `map` time -- Electron sets the OS-level
+            // window title from the loaded page's <title>, which can lag the
+            // surface actually mapping. Retry once the title lands instead of
+            // silently mis-classifying a not-yet-titled window as one of the
+            // real taskbar windows (empty string is never in
+            // WISPR_TASKBAR_TITLES, so this only ever widens what gets
+            // treated as auxiliary, never narrows it).
+            if (!this._titleWatched?.has(win)) {
+                this._titleWatched ??= new WeakSet();
+                this._titleWatched.add(win);
+                win.connect('notify::title', () => this._hideIfAuxiliary(win));
+            }
+            if (WISPR_TASKBAR_TITLES.has(win.get_title() ?? ''))
+                return;
+            win.hide_from_window_list();
+            // `hide_from_window_list()` only affects Alt-Tab/taskbar-style
+            // consumers that check `is_skip_taskbar()`; GNOME Shell's own
+            // Overview window grid additionally reads the `skip-taskbar`
+            // GObject property directly. Set both explicitly rather than
+            // relying on one to imply the other. Separately guarded: some
+            // Mutter versions expose this as constructor-only, in which case
+            // assignment throws and we fall through to the type/stacking
+            // fixes below regardless.
+            try {
+                win.skip_taskbar = true;
+            } catch (e) {
+                // Read-only in this Mutter version; hide_from_window_list()
+                // above is the fallback lever.
+            }
+            // Wispr Flow's overlay windows are already asked (from the
+            // Electron side) to appear on every workspace; Wayland ignores
+            // that request for the same reason it ignores skip-taskbar, so
+            // mirror it here too rather than leaving the pill workspace-
+            // bound.
+            win.stick();
+            // Electron's `type: "toolbar"` BrowserWindow option is X11-only
+            // and does nothing on Wayland, so Mutter classifies the pill as
+            // an ordinary Meta.WindowType.NORMAL toplevel. A NORMAL window's
+            // always-on-top state is still subject to Mutter's normal
+            // focus/stacking rules, so the "always on top" status pill can
+            // end up rendered *behind* whatever window has focus -- from the
+            // user's perspective, the push-to-talk indicator never appears.
+            // UTILITY windows are stacked/raised independently of focus
+            // changes to the main application, matching what this window
+            // actually is.
+            win.set_type(Meta.WindowType.UTILITY);
+            if (!this._aboveWired?.has(win)) {
+                this._aboveWired ??= new WeakSet();
+                this._aboveWired.add(win);
+                GLib.idle_add(GLib.PRIORITY_DEFAULT_IDLE, () => {
+                    if (!win.is_destroyed?.())
+                        win.make_above();
+                    return GLib.SOURCE_REMOVE;
+                });
+            }
+        } catch (e) {
+            // Window can vanish mid-call (closed while we're inspecting it);
+            // nothing to clean up either way.
+        }
     }
 
     disable() {
+        if (this._mapId) {
+            global.window_manager.disconnect(this._mapId);
+            this._mapId = 0;
+        }
         if (this._focusChangedId) {
             global.display.disconnect(this._focusChangedId);
             this._focusChangedId = 0;
