@@ -21,6 +21,7 @@ import Meta from 'gi://Meta';
 import Shell from 'gi://Shell';
 
 import {Extension} from 'resource:///org/gnome/shell/extensions/extension.js';
+import * as Main from 'resource:///org/gnome/shell/ui/main.js';
 
 const BUS_NAME = 'org.wispr.flow.WindowBridge';
 const OBJECT_PATH = '/org/wispr/flow/WindowBridge';
@@ -127,6 +128,39 @@ const STATUS_ABOVE_MAX_HEIGHT = 160;
 
 function isStatusTitle(title) {
     return title === 'Status';
+}
+
+// Re-snap tolerance: skip re-positioning if we're already within this many
+// pixels of the target, so our own `position-changed` handler doesn't loop
+// against the move it just made.
+const STATUS_POSITION_TOLERANCE = 2;
+
+// The pill is bottom-centred in the status window with its bottom edge this
+// many logical px above the window's bottom (measured from the renderer DOM).
+// The window itself is sized by the app (linux-status-compact.sh patch).
+const STATUS_PILL_BOTTOM_INSET = 14;
+// Gap between the pill's bottom edge and the top of the dock.
+const STATUS_DOCK_GAP = 2;
+
+// Height of the (Ubuntu/dash-to-dock) dock as drawn by GNOME Shell. The dock
+// is Shell chrome, not a Meta.Window, so read its actor directly. Returns 0
+// if no dock is present.
+function dockHeight() {
+    let found = 0;
+    const walk = actor => {
+        if (found)
+            return;
+        if (actor.get_name?.() === 'dashtodockBox') {
+            found = actor.height;
+            return;
+        }
+        for (const c of actor.get_children?.() ?? [])
+            walk(c);
+    };
+    try {
+        walk(Main.layoutManager.uiGroup);
+    } catch (e) {}
+    return Math.round(found);
 }
 
 export default class WindowBridgeExtension extends Extension {
@@ -269,6 +303,55 @@ export default class WindowBridgeExtension extends Extension {
                 });
                 this._idleIds.add(id);
             }
+
+            // The dictation status pill specifically: pin it bottom-center.
+            // Wispr's own dock-edge placement code (and its drag-to-reposition
+            // feature) both work by asking Electron to move the BrowserWindow
+            // to an absolute (x, y) -- a request the base Wayland xdg_toplevel
+            // protocol has no way to carry at all (unlike X11, a Wayland
+            // client cannot place its own top-level window on screen; only
+            // the compositor can). Under native Wayland, Mutter silently
+            // accepts the surface and applies its own placement heuristic
+            // instead, which is what puts the pill wherever it lands rather
+            // than bottom-center, and why dragging it visibly does nothing.
+            // We're inside gnome-shell itself, so we CAN move it via
+            // Meta.Window -- the only place in the stack with the authority
+            // to position a toplevel Wayland surface. Dragging still won't
+            // work (there's no client-side move on Wayland), but this keeps
+            // the pill where it's meant to live.
+            // The context menu (language picker etc.) is a transparent
+            // overlay the app sizes to the whole work area and draws the menu
+            // inside at pill-relative coordinates; it only lines up if the
+            // window sits exactly at the work-area origin, which Wayland won't
+            // let the app enforce itself.
+            const title = win.get_title() ?? '';
+            if ((title === 'Context Menu' || title === 'Flow Context Menu') &&
+                !this._statusWired?.has(win)) {
+                this._statusWired ??= new WeakSet();
+                this._statusWired.add(win);
+                const pin = () => {
+                    try {
+                        const a = win.get_work_area_current_monitor();
+                        const r = win.get_frame_rect();
+                        if (r.x !== a.x || r.y !== a.y)
+                            win.move_frame(true, a.x, a.y);
+                    } catch (e) {}
+                };
+                pin();
+                win.connect('position-changed', pin);
+                win.connect('size-changed', pin);
+            }
+            if (win.get_title() === 'Status' && !this._statusWired?.has(win)) {
+                this._statusWired ??= new WeakSet();
+                this._statusWired.add(win);
+                this._pinStatusBottomCenter(win);
+                win.connect('position-changed', () =>
+                    this._pinStatusBottomCenter(win)
+                );
+                win.connect('size-changed', () =>
+                    this._pinStatusBottomCenter(win)
+                );
+            }
         } catch (e) {
             // Window can vanish mid-call (closed while we're inspecting it);
             // nothing to clean up either way.
@@ -293,6 +376,30 @@ export default class WindowBridgeExtension extends Extension {
                 win.make_above();
             else if (!small && win.is_above())
                 win.unmake_above();
+        } catch (e) {
+            // Window can vanish mid-call; nothing to clean up either way.
+        }
+    }
+
+    _pinStatusBottomCenter(win) {
+        try {
+            if (win.is_destroyed?.())
+                return;
+            const area = win.get_work_area_current_monitor();
+            const rect = win.get_frame_rect();
+            const {width, height} = rect;
+            const x = Math.round(area.x + (area.width - width) / 2);
+            const mon = global.display.get_monitor_geometry(win.get_monitor());
+            const dockTop = mon.y + mon.height - dockHeight();
+            const y = Math.round(
+                dockTop - STATUS_DOCK_GAP - height + STATUS_PILL_BOTTOM_INSET
+            );
+            if (
+                Math.abs(rect.x - x) <= STATUS_POSITION_TOLERANCE &&
+                Math.abs(rect.y - y) <= STATUS_POSITION_TOLERANCE
+            )
+                return;
+            win.move_frame(true, x, y);
         } catch (e) {
             // Window can vanish mid-call; nothing to clean up either way.
         }
