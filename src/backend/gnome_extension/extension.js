@@ -152,20 +152,30 @@ const STATUS_POSITION_TOLERANCE = 2;
 // itself is sized by the app (linux-status-compact.sh patch).
 const STATUS_DOCK_GAP = 2;
 
-// Height of the (Ubuntu/dash-to-dock) dock as drawn by GNOME Shell. The dock
-// is Shell chrome, not a Meta.Window, so read its actor directly. Returns 0
-// if no dock is present.
-function dockHeight() {
+// Height of the (Ubuntu/dash-to-dock) dock along the bottom edge of monitor
+// `monitor` as drawn by GNOME Shell, 0 if no dock is there (none at all, or
+// on another side, as Ubuntu's default left dock is, or on another monitor).
+// The dock is Shell chrome, not a Meta.Window, so read its actors directly.
+// Each dock's dashtodockContainer has its monitor in `monitor-index` and its
+// side as a style class (what dock themes style too). Take the height from
+// its dashtodockBox, which keeps it while autohide slides the container shut.
+function bottomDockHeight(monitor) {
     let found = 0;
-    const walk = actor => {
+    const walk = (actor, inDock) => {
         if (found)
             return;
-        if (actor.get_name?.() === 'dashtodockBox') {
+        const name = actor.get_name?.();
+        if (name === 'dashtodockContainer') {
+            if (actor.monitor_index !== monitor ||
+                !actor.has_style_class_name('bottom'))
+                return;
+            inDock = true;
+        } else if (inDock && name === 'dashtodockBox') {
             found = actor.height;
             return;
         }
         for (const c of actor.get_children?.() ?? [])
-            walk(c);
+            walk(c, inDock);
     };
     try {
         walk(Main.layoutManager.uiGroup);
@@ -537,9 +547,13 @@ export default class WindowBridgeExtension extends Extension {
             const rect = win.get_frame_rect();
             const {width, height} = rect;
             const x = Math.round(area.x + (area.width - width) / 2);
-            const mon = global.display.get_monitor_geometry(win.get_monitor());
-            const dockTop = mon.y + mon.height - dockHeight();
-            const y = Math.round(dockTop - STATUS_DOCK_GAP - height);
+            const monitor = win.get_monitor();
+            const mon = global.display.get_monitor_geometry(monitor);
+            // A fixed dock is outside the work area already; an autohiding
+            // one is not, so keep clear of its box as well.
+            const bottom = Math.min(area.y + area.height,
+                mon.y + mon.height - bottomDockHeight(monitor));
+            const y = Math.round(bottom - STATUS_DOCK_GAP - height);
             if (
                 Math.abs(rect.x - x) <= STATUS_POSITION_TOLERANCE &&
                 Math.abs(rect.y - y) <= STATUS_POSITION_TOLERANCE
