@@ -135,11 +135,12 @@ function isStatusTitle(title) {
 // against the move it just made.
 const STATUS_POSITION_TOLERANCE = 2;
 
-// The pill is bottom-centred in the status window with its bottom edge this
-// many logical px above the window's bottom (measured from the renderer DOM).
-// The window itself is sized by the app (linux-status-compact.sh patch).
-const STATUS_PILL_BOTTOM_INSET = 14;
-// Gap between the pill's bottom edge and the top of the dock.
+// Gap between the status window's bottom edge and the top of the dock. The
+// whole window has to stay clear of the dock, not just the pill painted in
+// it: dash-to-dock's intellihide shows an autohidden dock only while no
+// window's frame touches the dock box, and the pill window sits above every
+// other window, so any overlap keeps the dock hidden for good. The window
+// itself is sized by the app (linux-status-compact.sh patch).
 const STATUS_DOCK_GAP = 2;
 
 // Height of the (Ubuntu/dash-to-dock) dock as drawn by GNOME Shell. The dock
@@ -171,6 +172,7 @@ export default class WindowBridgeExtension extends Extension {
         this._auxSaved = new Map();
         this._winSignals = new Map();
         this._aboveWatched = new Set();
+        this._statusWired = new Set();
         this._idleIds = new Set();
 
         this._dbusImpl = Gio.DBusExportedObject.wrapJSObject(IFACE_XML, this);
@@ -326,8 +328,7 @@ export default class WindowBridgeExtension extends Extension {
             // let the app enforce itself.
             const title = win.get_title() ?? '';
             if ((title === 'Context Menu' || title === 'Flow Context Menu') &&
-                !this._statusWired?.has(win)) {
-                this._statusWired ??= new WeakSet();
+                !this._statusWired.has(win)) {
                 this._statusWired.add(win);
                 const pin = () => {
                     try {
@@ -338,17 +339,16 @@ export default class WindowBridgeExtension extends Extension {
                     } catch (e) {}
                 };
                 pin();
-                win.connect('position-changed', pin);
-                win.connect('size-changed', pin);
+                this._connectWin(win, 'position-changed', pin);
+                this._connectWin(win, 'size-changed', pin);
             }
-            if (win.get_title() === 'Status' && !this._statusWired?.has(win)) {
-                this._statusWired ??= new WeakSet();
+            if (isStatusTitle(win.get_title()) && !this._statusWired.has(win)) {
                 this._statusWired.add(win);
                 this._pinStatusBottomCenter(win);
-                win.connect('position-changed', () =>
+                this._connectWin(win, 'position-changed', () =>
                     this._pinStatusBottomCenter(win)
                 );
-                win.connect('size-changed', () =>
+                this._connectWin(win, 'size-changed', () =>
                     this._pinStatusBottomCenter(win)
                 );
             }
@@ -391,9 +391,7 @@ export default class WindowBridgeExtension extends Extension {
             const x = Math.round(area.x + (area.width - width) / 2);
             const mon = global.display.get_monitor_geometry(win.get_monitor());
             const dockTop = mon.y + mon.height - dockHeight();
-            const y = Math.round(
-                dockTop - STATUS_DOCK_GAP - height + STATUS_PILL_BOTTOM_INSET
-            );
+            const y = Math.round(dockTop - STATUS_DOCK_GAP - height);
             if (
                 Math.abs(rect.x - x) <= STATUS_POSITION_TOLERANCE &&
                 Math.abs(rect.y - y) <= STATUS_POSITION_TOLERANCE
@@ -447,6 +445,7 @@ export default class WindowBridgeExtension extends Extension {
         this._disconnectWin(win);
         this._auxSaved.delete(win);
         this._aboveWatched.delete(win);
+        this._statusWired.delete(win);
     }
 
     disable() {
@@ -468,6 +467,7 @@ export default class WindowBridgeExtension extends Extension {
         for (const w of [...(this._winSignals?.keys() ?? [])])
             this._disconnectWin(w);
         this._aboveWatched?.clear();
+        this._statusWired?.clear();
         this._disconnectTitle();
         this._focusWindow = null;
 
