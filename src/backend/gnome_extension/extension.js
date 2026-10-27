@@ -114,6 +114,19 @@ function windowInfo(win) {
 const WISPR_WM_CLASS = 'wispr-flow';
 const WISPR_TASKBAR_TITLES = new Set(['Hub', 'Wispr Flow', 'Scratchpad']);
 
+// Mutter made hide_from_window_list(), show_in_window_list() and set_type()
+// public on Meta.Window only in 49. GNOME 45-48 have none of them, so there
+// the auxiliary windows keep their taskbar/Alt-Tab/Overview entry and stay
+// NORMAL, but still get every other fix below. Those versions give the
+// shell no other way to hide another client's Wayland window: the
+// skip-taskbar property is read-only, Meta.WaylandClient's
+// hide_from_window_list() only works on a client the shell spawned itself,
+// and the Shell's own filters all read that same flag, the dock's running
+// apps in C (ShellApp), so patching the JS ones would leave the dock entry.
+const CAN_HIDE_FROM_WINDOW_LIST =
+    typeof Meta.Window.prototype.hide_from_window_list === 'function';
+const CAN_SET_TYPE = typeof Meta.Window.prototype.set_type === 'function';
+
 // Mutter refuses focus to a newly mapped window that is mostly (60%+)
 // covered by "above" windows and stacks it under the focused one
 // (window_would_mostly_be_covered_by_always_above_window in
@@ -385,21 +398,10 @@ export default class WindowBridgeExtension extends Extension {
                     skipTaskbar: win.is_skip_taskbar(),
                 });
             }
-            win.hide_from_window_list();
-            // `hide_from_window_list()` only affects Alt-Tab/taskbar-style
-            // consumers that check `is_skip_taskbar()`; GNOME Shell's own
-            // Overview window grid additionally reads the `skip-taskbar`
-            // GObject property directly. Set both explicitly rather than
-            // relying on one to imply the other. Separately guarded: some
-            // Mutter versions expose this as constructor-only, in which case
-            // assignment throws and we fall through to the type/stacking
-            // fixes below regardless.
-            try {
-                win.skip_taskbar = true;
-            } catch (e) {
-                // Read-only in this Mutter version; hide_from_window_list()
-                // above is the fallback lever.
-            }
+            // This sets the flag behind both is_skip_taskbar() and the
+            // read-only `skip-taskbar` property the Overview reads.
+            if (CAN_HIDE_FROM_WINDOW_LIST)
+                win.hide_from_window_list();
             // Wispr Flow's overlay windows are already asked (from the
             // Electron side) to appear on every workspace; Wayland ignores
             // that request for the same reason it ignores skip-taskbar, so
@@ -416,7 +418,8 @@ export default class WindowBridgeExtension extends Extension {
             // UTILITY windows are stacked/raised independently of focus
             // changes to the main application, matching what this window
             // actually is.
-            win.set_type(Meta.WindowType.UTILITY);
+            if (CAN_SET_TYPE)
+                win.set_type(Meta.WindowType.UTILITY);
             // Only the status pill is kept above other windows. The other
             // auxiliary windows (the work-area-sized context menu overlay)
             // would take focus from every new window under them, and a
@@ -560,8 +563,9 @@ export default class WindowBridgeExtension extends Extension {
                 win.unmake_above();
             if (!saved.sticky && win.is_on_all_workspaces())
                 win.unstick();
-            win.set_type(saved.type);
-            if (!saved.skipTaskbar)
+            if (CAN_SET_TYPE)
+                win.set_type(saved.type);
+            if (CAN_HIDE_FROM_WINDOW_LIST && !saved.skipTaskbar)
                 win.show_in_window_list();
         } catch (e) {
             // Window destroyed since we recorded it.
