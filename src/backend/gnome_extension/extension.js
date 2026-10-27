@@ -447,9 +447,11 @@ export default class WindowBridgeExtension extends Extension {
                     this._pinStatusBottomCenter(win)
                 );
                 this._statusWins.add(win);
-                win.connect('unmanaged', () => this._statusWins.delete(win));
+                this._connectWin(win, 'unmanaged', () =>
+                    this._statusWins.delete(win)
+                );
                 // Re-evaluate if the pill lands on a different monitor.
-                win.connect('position-changed', () =>
+                this._connectWin(win, 'position-changed', () =>
                     this._updateClickThrough(win)
                 );
                 this._updateClickThrough(win);
