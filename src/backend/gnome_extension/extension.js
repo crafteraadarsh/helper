@@ -108,21 +108,35 @@ function windowInfo(win) {
 // taskbar/Overview/Alt-Tab (issue: the pill is "always open" from the user's
 // perspective). We run inside gnome-shell's own process, so we can correct
 // Mutter's classification directly via Meta.Window, independent of whatever
-// protocol the client did or didn't speak. `Hub` and `Scratchpad` are the
-// only two Wispr Flow windows meant to be real, user-facing taskbar entries.
+// protocol the client did or didn't speak. The Hub (titled `Hub` before
+// 1.6.1264, `Wispr Flow` since) and `Scratchpad` are the only Wispr Flow
+// windows meant to be real, user-facing taskbar entries.
 const WISPR_WM_CLASS = 'wispr-flow';
-const WISPR_TASKBAR_TITLES = new Set(['Hub', 'Scratchpad']);
+const WISPR_TASKBAR_TITLES = new Set(['Hub', 'Wispr Flow', 'Scratchpad']);
+
+// Mutter refuses focus to a newly mapped window that is mostly (60%+)
+// covered by "above" windows and stacks it under the focused one
+// (window_would_mostly_be_covered_by_always_above_window in
+// src/core/window.c). The status window is mostly transparent canvas around
+// the pill (512x614 in 1.6.1209 and 1.6.1264, bottom-centred), so raising it
+// at that size takes focus from anything small that maps there, including
+// wl-clipboard's surface, which then waits for focus forever and hangs copy
+// and paste. Keep the pill above only while its window is no bigger than
+// this; linux-status-compact.sh in the app repo makes it 200x110.
+const STATUS_ABOVE_MAX_WIDTH = 256;
+const STATUS_ABOVE_MAX_HEIGHT = 160;
 
 // Re-snap tolerance: skip re-positioning if we're already within this many
 // pixels of the target, so our own `position-changed` handler doesn't loop
 // against the move it just made.
 const STATUS_POSITION_TOLERANCE = 2;
 
-// The pill is bottom-centred in the status window with its bottom edge this
-// many logical px above the window's bottom (measured from the renderer DOM).
-// The window itself is sized by the app (linux-status-compact.sh patch).
-const STATUS_PILL_BOTTOM_INSET = 14;
-// Gap between the pill's bottom edge and the top of the dock.
+// Gap between the status window's bottom edge and the top of the dock. The
+// whole window has to stay clear of the dock, not just the pill painted in
+// it: dash-to-dock's intellihide shows an autohidden dock only while no
+// window's frame touches the dock box, and the pill window sits above every
+// other window, so any overlap keeps the dock hidden for good. The window
+// itself is sized by the app (linux-status-compact.sh patch).
 const STATUS_DOCK_GAP = 2;
 
 // Height of the (Ubuntu/dash-to-dock) dock as drawn by GNOME Shell. The dock
@@ -156,6 +170,15 @@ function isStatusTitle(title) {
 
 export default class WindowBridgeExtension extends Extension {
     enable() {
+        // Wispr windows we changed -> their state before we touched them, and
+        // every signal we connected on a window, so disable() can put back
+        // exactly what Mutter had and leave nothing running behind it.
+        this._auxSaved = new Map();
+        this._winSignals = new Map();
+        this._aboveWatched = new Set();
+        this._statusWired = new Set();
+        this._idleIds = new Set();
+
         // Must exist before the sweep below wires an already-open status pill.
         this._statusWins = new Set();
         this._clickThroughSaved = new WeakMap();
@@ -377,9 +400,9 @@ export default class WindowBridgeExtension extends Extension {
     // Wispr Flow's auxiliary windows, and corrects its window type so it
     // actually behaves like the overlay it's meant to be. Idempotent and safe
     // to call repeatedly (each of these calls is a no-op on a window already
-    // in the target state), so both the `map` handler and the enable()-time
-    // sweep can call it unconditionally without tracking which windows were
-    // already seen.
+    // in the target state, and the pre-change state is recorded only once),
+    // so the `map` handler, the title watch and the enable()-time sweep can
+    // all call it unconditionally.
     _hideIfAuxiliary(win) {
         if (!win)
             return;
@@ -392,15 +415,28 @@ export default class WindowBridgeExtension extends Extension {
             // surface actually mapping. Retry once the title lands instead of
             // silently mis-classifying a not-yet-titled window as one of the
             // real taskbar windows (empty string is never in
-            // WISPR_TASKBAR_TITLES, so this only ever widens what gets
-            // treated as auxiliary, never narrows it).
-            if (!this._titleWatched?.has(win)) {
-                this._titleWatched ??= new WeakSet();
-                this._titleWatched.add(win);
-                win.connect('notify::title', () => this._hideIfAuxiliary(win));
+            // WISPR_TASKBAR_TITLES, so an untitled window is treated as
+            // auxiliary until its title says otherwise, and is restored then).
+            if (!this._winSignals.has(win)) {
+                this._connectWin(win, 'notify::title', () =>
+                    this._hideIfAuxiliary(win)
+                );
+                this._connectWin(win, 'unmanaged', () =>
+                    this._forgetWindow(win)
+                );
             }
-            if (WISPR_TASKBAR_TITLES.has(win.get_title() ?? ''))
+            if (WISPR_TASKBAR_TITLES.has(win.get_title() ?? '')) {
+                this._restoreWindow(win);
                 return;
+            }
+            if (!this._auxSaved.has(win)) {
+                this._auxSaved.set(win, {
+                    type: win.get_window_type(),
+                    above: win.is_above(),
+                    sticky: win.is_on_all_workspaces(),
+                    skipTaskbar: win.is_skip_taskbar(),
+                });
+            }
             win.hide_from_window_list();
             // `hide_from_window_list()` only affects Alt-Tab/taskbar-style
             // consumers that check `is_skip_taskbar()`; GNOME Shell's own
@@ -433,14 +469,24 @@ export default class WindowBridgeExtension extends Extension {
             // changes to the main application, matching what this window
             // actually is.
             win.set_type(Meta.WindowType.UTILITY);
-            if (!this._aboveWired?.has(win)) {
-                this._aboveWired ??= new WeakSet();
-                this._aboveWired.add(win);
-                GLib.idle_add(GLib.PRIORITY_DEFAULT_IDLE, () => {
-                    if (!win.is_destroyed?.())
-                        win.make_above();
+            // Only the status pill is kept above other windows. The other
+            // auxiliary windows (the work-area-sized context menu overlay)
+            // would take focus from every new window under them, and a
+            // misclassified main window would sit on top of everything.
+            if (isStatusTitle(win.get_title()) &&
+                !this._aboveWatched.has(win)) {
+                this._aboveWatched.add(win);
+                this._connectWin(win, 'size-changed', () =>
+                    this._updateStatusAbove(win)
+                );
+                // Deferred: an above state set while the window is still
+                // mapping does not stick.
+                const id = GLib.idle_add(GLib.PRIORITY_DEFAULT_IDLE, () => {
+                    this._idleIds.delete(id);
+                    this._updateStatusAbove(win);
                     return GLib.SOURCE_REMOVE;
                 });
+                this._idleIds.add(id);
             }
 
             // The dictation status pill specifically: pin it bottom-center.
@@ -465,8 +511,7 @@ export default class WindowBridgeExtension extends Extension {
             // let the app enforce itself.
             const title = win.get_title() ?? '';
             if ((title === 'Context Menu' || title === 'Flow Context Menu') &&
-                !this._statusWired?.has(win)) {
-                this._statusWired ??= new WeakSet();
+                !this._statusWired.has(win)) {
                 this._statusWired.add(win);
                 const pin = () => {
                     try {
@@ -477,33 +522,59 @@ export default class WindowBridgeExtension extends Extension {
                     } catch (e) {}
                 };
                 pin();
-                win.connect('position-changed', pin);
-                win.connect('size-changed', pin);
+                this._connectWin(win, 'position-changed', pin);
+                this._connectWin(win, 'size-changed', pin);
             }
-            if (isStatusTitle(win.get_title()) && !this._statusWired?.has(win)) {
-                this._statusWired ??= new WeakSet();
+            if (isStatusTitle(win.get_title()) && !this._statusWired.has(win)) {
                 this._statusWired.add(win);
                 this._pinStatusBottomCenter(win);
-                win.connect('position-changed', () =>
+                this._connectWin(win, 'position-changed', () =>
                     this._pinStatusBottomCenter(win)
                 );
-                win.connect('size-changed', () =>
+                this._connectWin(win, 'size-changed', () =>
                     this._pinStatusBottomCenter(win)
                 );
                 this._statusWins.add(win);
-                win.connect('unmanaged', () => this._statusWins.delete(win));
+                this._connectWin(win, 'unmanaged', () =>
+                    this._statusWins.delete(win)
+                );
                 // Re-evaluate if the pill lands on a different monitor.
-                win.connect('position-changed', () =>
+                this._connectWin(win, 'position-changed', () =>
                     this._updateClickThrough(win)
                 );
                 this._updateClickThrough(win);
                 // The renderer publishes the pill's painted box in the title.
-                win.connect('notify::title', () => this._applyStatusShape(win));
+                this._connectWin(win, 'notify::title', () =>
+                    this._applyStatusShape(win)
+                );
                 this._applyStatusShape(win);
             }
         } catch (e) {
             // Window can vanish mid-call (closed while we're inspecting it);
             // nothing to clean up either way.
+        }
+    }
+
+    // Keep the status pill above other windows while its window is small
+    // enough not to trip Mutter's focus refusal (see STATUS_ABOVE_MAX_WIDTH),
+    // and drop it back to the normal layer while it is not. Without the
+    // compact-window patch the pill can then sit behind the focused window,
+    // which is the lesser problem.
+    _updateStatusAbove(win) {
+        try {
+            const saved = this._auxSaved.get(win);
+            // Gone, retitled as a real window, or above on its own already.
+            if (!saved || saved.above)
+                return;
+            const {width, height} = win.get_frame_rect();
+            const small = width <= STATUS_ABOVE_MAX_WIDTH &&
+                height <= STATUS_ABOVE_MAX_HEIGHT;
+            if (small && !win.is_above())
+                win.make_above();
+            else if (!small && win.is_above())
+                win.unmake_above();
+        } catch (e) {
+            // Window can vanish mid-call; nothing to clean up either way.
         }
     }
 
@@ -517,9 +588,7 @@ export default class WindowBridgeExtension extends Extension {
             const x = Math.round(area.x + (area.width - width) / 2);
             const mon = global.display.get_monitor_geometry(win.get_monitor());
             const dockTop = mon.y + mon.height - dockHeight();
-            const y = Math.round(
-                dockTop - STATUS_DOCK_GAP - height + STATUS_PILL_BOTTOM_INSET
-            );
+            const y = Math.round(dockTop - STATUS_DOCK_GAP - height);
             if (
                 Math.abs(rect.x - x) <= STATUS_POSITION_TOLERANCE &&
                 Math.abs(rect.y - y) <= STATUS_POSITION_TOLERANCE
@@ -529,6 +598,51 @@ export default class WindowBridgeExtension extends Extension {
         } catch (e) {
             // Window can vanish mid-call; nothing to clean up either way.
         }
+    }
+
+    // Undo everything _hideIfAuxiliary changed on win, back to the state
+    // recorded before the first change.
+    _restoreWindow(win) {
+        const saved = this._auxSaved.get(win);
+        if (!saved)
+            return;
+        this._auxSaved.delete(win);
+        try {
+            if (!saved.above && win.is_above())
+                win.unmake_above();
+            if (!saved.sticky && win.is_on_all_workspaces())
+                win.unstick();
+            win.set_type(saved.type);
+            if (!saved.skipTaskbar)
+                win.show_in_window_list();
+        } catch (e) {
+            // Window destroyed since we recorded it.
+        }
+    }
+
+    _connectWin(win, name, fn) {
+        let ids = this._winSignals.get(win);
+        if (!ids) {
+            ids = [];
+            this._winSignals.set(win, ids);
+        }
+        ids.push(win.connect(name, fn));
+    }
+
+    _disconnectWin(win) {
+        for (const id of this._winSignals.get(win) ?? []) {
+            try {
+                win.disconnect(id);
+            } catch (e) {}
+        }
+        this._winSignals.delete(win);
+    }
+
+    _forgetWindow(win) {
+        this._disconnectWin(win);
+        this._auxSaved.delete(win);
+        this._aboveWatched.delete(win);
+        this._statusWired.delete(win);
     }
 
     disable() {
@@ -552,6 +666,17 @@ export default class WindowBridgeExtension extends Extension {
             } catch (e) {}
         });
         this._statusWins?.clear();
+        for (const id of this._idleIds ?? [])
+            GLib.source_remove(id);
+        this._idleIds?.clear();
+        // Lower, unstick and re-list every window we changed, so turning the
+        // extension off undoes it without restarting Wispr Flow.
+        for (const w of [...(this._auxSaved?.keys() ?? [])])
+            this._restoreWindow(w);
+        for (const w of [...(this._winSignals?.keys() ?? [])])
+            this._disconnectWin(w);
+        this._aboveWatched?.clear();
+        this._statusWired?.clear();
         this._disconnectTitle();
         this._focusWindow = null;
 
