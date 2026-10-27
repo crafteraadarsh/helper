@@ -492,7 +492,9 @@ export default class WindowBridgeExtension extends Extension {
                 );
                 this._updateClickThrough(win);
                 // The renderer publishes the pill's painted box in the title.
-                win.connect('notify::title', () => this._applyStatusShape(win));
+                this._connectWin(win, 'notify::title', () =>
+                    this._applyStatusShape(win)
+                );
                 this._applyStatusShape(win);
             }
         } catch (e) {
